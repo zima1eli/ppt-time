@@ -157,3 +157,5 @@ Compress-Archive -Path 'dist/ppt time/*' -DestinationPath dist/ppt-time-Windows-
 ## 来源
 
 项目基于 QwejayHuang 的开源 [QTimer](https://github.com/Qwejay/QTimer) v1.6.0（提交 `6c966c1`）。本版在该基础上实现会议计时、放映控制及文件传输，使用 GPL-3.0 许可证，见 [LICENSE](LICENSE)。
+
+Windows 安装版和便携版随附的运行组件及其来源见 [第三方组件声明](THIRD-PARTY-NOTICES.txt)。
