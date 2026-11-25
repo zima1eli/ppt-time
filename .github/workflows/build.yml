@@ -1,0 +1,206 @@
+name: Build and release ppt time
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  source:
+    name: Package corresponding source
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read product version
+        id: version
+        run: |
+          python3 - <<'PY'
+          import ast, os, re
+          from pathlib import Path
+          nodes = ast.parse(Path("main.py").read_text(encoding="utf-8")).body
+          version = next(ast.literal_eval(n.value) for n in nodes if isinstance(n, ast.Assign)
+                         and any(isinstance(t, ast.Name) and t.id == "__version__" for t in n.targets))
+          assert re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version), version
+          if os.environ["GITHUB_REF_TYPE"] == "tag" and os.environ["GITHUB_REF_NAME"] != "v" + version:
+              raise SystemExit("Git tag and the ppt time product version differ.")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              print("version=" + version, file=out)
+          PY
+      - name: Archive source and executable Mac launcher
+        run: |
+          source_dir="$(mktemp -d)"
+          git archive --prefix=ppt-time/ HEAD | tar -x -C "$source_dir"
+          chmod +x "$source_dir/ppt-time/Start-ppt-time.command"
+          (cd "$source_dir" && zip -qr "$GITHUB_WORKSPACE/ppt-time-Source.zip" ppt-time)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ppt-time-source
+          path: ppt-time-Source.zip
+          if-no-files-found: error
+
+  build:
+    name: Build ${{ matrix.platform }}
+    needs: source
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: Windows-x64
+            runner: windows-2022
+          - platform: macOS-arm64
+            runner: macos-15
+          - platform: macOS-x64
+            runner: macos-15-intel
+    runs-on: ${{ matrix.runner }}
+    env:
+      VERSION: ${{ needs.source.outputs.version }}
+      PLATFORM: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt pyinstaller==6.22.3
+      - name: Verify required projection and QR components
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -c "import segno; from PySide6 import QtPdf, QtMultimedia, QtMultimediaWidgets, QtSvg, QtWidgets; import main, relay_server"
+      - name: Run application tests
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m unittest discover -s tests -v
+      - uses: actions/download-artifact@v4
+        with:
+          name: ppt-time-source
+          path: package
+      - name: Include operator guide, service and license
+        shell: bash
+        run: |
+          mkdir -p out
+          cp README.md LICENSE relay_server.py package/
+          if test -f PPTClock-4.4.0-inventory.md; then cp PPTClock-4.4.0-inventory.md package/; fi
+      - name: Build Windows portable and per-user installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $python = (Get-Command python).Source
+          & $python powerpoint_addin/build.py
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          & $python -c "from comtypes.client import GetModule; GetModule('UIAutomationCore.dll'); import comtypes.gen.UIAutomationClient"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $argsForBuild = @('--onedir', '--windowed', '--noconfirm', '--name=ppt time', '--icon=icon.ico',
+                            '--version-file=version.txt', '--add-data=icon.ico:.', '--add-data=icon.svg:.',
+                            '--add-data=wps_pdf_addin:wps_pdf_addin', '--add-data=wps_presentation_addin:wps_presentation_addin',
+                            '--hidden-import=comtypes.gen.UIAutomationClient',
+                            '--add-data=powerpoint_addin/PptTime.PowerPointBridge.dll:powerpoint_addin',
+                            '--hidden-import=PySide6.QtPdf', '--hidden-import=PySide6.QtMultimedia',
+                            '--hidden-import=PySide6.QtMultimediaWidgets', '--hidden-import=win32timezone',
+                            '--hidden-import=win32com.client', '--hidden-import=win32ui', '--collect-submodules=segno')
+          $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot;$env:SystemRoot\System32\Wbem"
+          & $python -m PyInstaller @argsForBuild main.py
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          foreach ($asset in @('index.html', 'index_TaskPane.html', 'reader.js', 'ribbon.xml')) {
+            if (!(Test-Path -LiteralPath "dist/ppt time/_internal/wps_pdf_addin/$asset" -PathType Leaf)) {
+              throw "Missing WPS PDF add-in asset: $asset"
+            }
+          }
+          foreach ($asset in @('index.html', 'ribbon.xml', 'main.js')) {
+            $source = Get-FileHash -LiteralPath "wps_presentation_addin/$asset" -ErrorAction Stop
+            $copy = Get-FileHash -LiteralPath "dist/ppt time/_internal/wps_presentation_addin/$asset" -ErrorAction Stop
+            if ($copy.Hash -ne $source.Hash) {
+              throw "WPS Presentation add-in asset differs: $asset"
+            }
+          }
+          if (!(Test-Path -LiteralPath 'dist/ppt time/_internal/powerpoint_addin/PptTime.PowerPointBridge.dll' -PathType Leaf)) {
+            throw 'Missing PowerPoint page add-in'
+          }
+          Copy-Item -Path 'dist/ppt time/*' -Destination package -Recurse
+          & $python packaging/build_windows_installer.py package out/ppt-time-Setup.exe --version $env:VERSION --icon icon.ico
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          & $python packaging/verify_windows_installer.py package out/ppt-time-Setup.exe
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          Compress-Archive -Path package/* -DestinationPath out/ppt-time-Windows-x64.zip
+      - name: Build macOS application
+        if: runner.os == 'macOS'
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          mkdir ppt-time.iconset
+          python - <<'PY'
+          from PySide6.QtCore import Qt
+          from PySide6.QtGui import QGuiApplication, QImage, QPainter
+          from PySide6.QtSvg import QSvgRenderer
+          app = QGuiApplication([])
+          svg = QSvgRenderer("icon.svg")
+          assert svg.isValid()
+          for size in (16, 32, 128, 256, 512):
+              for scale in (1, 2):
+                  n = size * scale
+                  img = QImage(n, n, QImage.Format.Format_ARGB32_Premultiplied)
+                  img.fill(Qt.GlobalColor.transparent)
+                  painter = QPainter(img)
+                  svg.render(painter)
+                  painter.end()
+                  name = f"icon_{size}x{size}" + ("@2x" if scale == 2 else "")
+                  assert img.save(f"ppt-time.iconset/{name}.png")
+          PY
+          iconutil -c icns ppt-time.iconset -o ppt-time.icns
+          python -m PyInstaller --onedir --windowed --noconfirm --name 'ppt time' \
+            --osx-bundle-identifier org.ppttime.desktop --icon ppt-time.icns \
+            --add-data 'icon.ico:.' --add-data 'icon.svg:.' --collect-submodules=segno \
+            --hidden-import=PySide6.QtPdf --hidden-import=PySide6.QtMultimedia \
+            --hidden-import=PySide6.QtMultimediaWidgets main.py
+          python - <<'PY'
+          import os, plistlib
+          from pathlib import Path
+          path = Path("dist/ppt time.app/Contents/Info.plist")
+          values = plistlib.loads(path.read_bytes())
+          values.update(CFBundleName="ppt time", CFBundleDisplayName="ppt time",
+                        CFBundleVersion=os.environ["VERSION"], CFBundleShortVersionString=os.environ["VERSION"],
+                        LSMinimumSystemVersion="14.0",
+                        NSAppleEventsUsageDescription="ppt time 使用 PowerPoint 的放映状态和页码进行会议计时和翻页。")
+          path.write_bytes(plistlib.dumps(values))
+          PY
+          codesign --force --sign - 'dist/ppt time.app'
+          codesign --verify --deep --strict 'dist/ppt time.app'
+          mv 'dist/ppt time.app' package/
+          ditto -c -k --sequesterRsrc package "out/ppt-time-${PLATFORM}.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ppt-time-${{ matrix.platform }}
+          path: out/*
+          if-no-files-found: error
+
+  release:
+    name: Collect packages and checksums
+    needs: [source, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: ppt-time-*
+          merge-multiple: true
+          path: out
+      - name: Calculate SHA-256
+        run: cd out && sha256sum *.exe *.zip > SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ppt-time-checksums
+          path: out/SHA256SUMS.txt
+          if-no-files-found: error
+      - name: Publish tagged release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ppt time ${{ needs.source.outputs.version }}
+          files: out/*
+          generate_release_notes: true

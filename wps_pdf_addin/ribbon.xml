@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<customUI xmlns="http://schemas.microsoft.com/office/2009/07/customui" onLoad="pptTimeLoaded">
+  <ribbon><tabs><tab id="PptTimePdfTools" label="ppt time">
+    <group id="PptTimeConnection" label="放映计时">
+      <button id="PptTimeStatus" label="查看计时连接" onAction="pptTimeStatus"/>
+    </group>
+  </tab></tabs></ribbon>
+</customUI>

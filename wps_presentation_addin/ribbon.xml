@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<customUI xmlns="http://schemas.microsoft.com/office/2009/07/customui" onLoad="pptTimeWppLoaded">
+  <ribbon><tabs><tab id="PptTimeWppTab" label="ppt time">
+    <group id="PptTimeWppGroup" label="放映页码">
+      <button id="PptTimeWppStatus" label="查看页码联动状态" onAction="pptTimeWppStatus"/>
+    </group>
+  </tab></tabs></ribbon>
+</customUI>
